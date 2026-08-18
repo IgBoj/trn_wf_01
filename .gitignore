@@ -1,0 +1,8 @@
+build/
+managed_components/
+sdkconfig.defaults.my
+.clang-format
+.cproject
+.gitattributes
+.project
+dependencies.lock
