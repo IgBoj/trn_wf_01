@@ -42,6 +42,19 @@ static uint8_t *jpeg_out_buffer = NULL;
 static size_t last_jpeg_size = 0;
 // func declare
 size_t form_jpeg_from_rgb(const uint8_t *rgb_buf);
+#include <stdbool.h>
+#include <string.h>
+
+// Резервируем безопасный размер под один JPEG кадр 360x240
+#define NET_JPEG_MAX_SIZE (25 * 1024) 
+
+// Выделенный изолированный буфер в PSRAM для отправки
+static EXT_RAM_ATTR uint8_t net_mjpeg_buffer[NET_JPEG_MAX_SIZE];
+static size_t net_mjpeg_size = 0;
+
+// Атомарные флаги для полностью асинхронного обмена
+static volatile bool net_request_new_frame = false; // Сигнал от сети: "Пришли следующий кадр"
+static volatile bool net_has_fresh_frame   = false; // Флаг для сети: "В буфере лежит свежий кадр"
 
 // Глобальные переменные
 extern lv_obj_t *ui_imgCameraView;
@@ -154,26 +167,37 @@ static void camera_video_frame_operation(
         return;
     }
 
-    // КРИТИЧНО: Синхронизация кэша после записи PPA (DMA → CPU)
-    esp_cache_msync(lcd_buffer[buf_index], 
-                    ALIGN_UP(out_size, data_cache_line_size),
-                    ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+	// КРИТИЧНО: Синхронизация кэша после записи PPA (DMA → CPU)
+	esp_cache_msync(lcd_buffer[buf_index], 
+	                ALIGN_UP(out_size, data_cache_line_size),
+	                ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
 
-	// --- Кодирование в JPEG ---
-	size_t jpeg_len = form_jpeg_from_rgb((const uint8_t *)lcd_buffer[buf_index]);
-	static int info_cntr_jpg = 0;
-	if (jpeg_len > 0) {
-	    // Здесь jpeg_out_buffer содержит готовый JPEG размером jpeg_len байт
-		if (info_cntr_jpg <5 ){
-			ESP_LOGI(TAG, "JPEG formed: %u bytes", jpeg_len);
-			info_cntr_jpg++;
-			}
+	// --- Асинхронное кодирование в JPEG для сети (5 FPS) ---
+	if (is_video_streaming && p2p_uclient_is_stream_allowed() && net_request_new_frame) {
+	    
+	    // Кодируем RGB-массив в рабочий буфер кодировщика
+	    size_t jpeg_len = form_jpeg_from_rgb((const uint8_t *)lcd_buffer[buf_index]);
+	    
+	    if (jpeg_len > 0 && jpeg_len <= NET_JPEG_MAX_SIZE) {
+	        // Мгновенно копируем результат в изолированный сетевой буфер
+	        memcpy(net_mjpeg_buffer, jpeg_out_buffer, jpeg_len);
+	        net_mjpeg_size = jpeg_len;
+	        
+	        // Меняем статус флагов: кадр готов, запрос снимаем
+	        net_has_fresh_frame = true;
+	        net_request_new_frame = false; 
+	        
+	        static int info_cntr_jpg = 0;
+	        if (info_cntr_jpg < 5) {
+	            ESP_LOGI(TAG, "Captured real frame for net: %u bytes", (unsigned int)net_mjpeg_size);
+	            info_cntr_jpg++;
+	        }
+	    }
 	}
-	// ----------------------------------------
-					
-					
-    // Настраиваем дескриптор для LVGL 9
-    camera_image_dsc.header.magic = LV_IMAGE_SRC_VARIABLE;
+	// -----------------------------------------------------------------
+	                
+	// Настраиваем дескриптор для LVGL 9
+	camera_image_dsc.header.magic = LV_IMAGE_SRC_VARIABLE;
     camera_image_dsc.header.w = display_width;
     camera_image_dsc.header.h = display_height;
     camera_image_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
@@ -394,27 +418,58 @@ void app_main(void) {
 
 	ESP_LOGI(TAG, "System initialized successfully! Press START button.");
 	
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(200));  // Loop step
+	// Настройка автоматического таймера для удержания FPS
+	TickType_t xLastWakeTime = xTaskGetTickCount();
+	const TickType_t xFrequency = pdMS_TO_TICKS(200); // Интервал ровно 200 мс (5 FPS)
 
-        if (!p2p_uclient_is_connected()) {
-			ESP_LOGI(TAG, "(Conn lost)");
-            continue;
-        }
-		
-        // Телеметрию шлём всегда — она лёгкая
-        p2p_uclient_send_telemetry(fake_telemetry, sizeof(fake_telemetry));
-        vTaskDelay(pdMS_TO_TICKS(10));
+	while (1) {
+	    // Поток засыпает ровно до начала следующего 200 мс интервала
+	    vTaskDelayUntil(&xLastWakeTime, xFrequency);  
 
-        // MJPEG шлём ТОЛЬКО когда мастер явно разрешил
-        if (p2p_uclient_is_stream_allowed() && fake_mjpeg_frame) {
-            p2p_uclient_send_mjpeg(fake_mjpeg_frame, simulated_image_size);
-            ESP_LOGI(TAG, "%ikB MJPEG (stream allowed)", mpg_sz);
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } else if (fake_mjpeg_frame) {
-             ESP_LOGI(TAG, "Stream NA");
-        }
-    }
+	    if (!p2p_uclient_is_connected()) {
+	        ESP_LOGI(TAG, "(Conn lost)");
+	        net_request_new_frame = false;
+	        net_has_fresh_frame = false;
+	        continue;
+	    }
+	    
+	    // Телеметрию шлём всегда — она лёгкая
+	    p2p_uclient_send_telemetry(fake_telemetry, sizeof(fake_telemetry));
+	    vTaskDelay(pdMS_TO_TICKS(10));
+
+	    // MJPEG шлём ТОЛЬКО когда мастер явно разрешил
+	    if (p2p_uclient_is_stream_allowed()) {
+	        
+	        // 1. Проверяем, успел ли поток камеры положить свежий кадр с момента прошлой итерации
+	        if (net_has_fresh_frame && net_mjpeg_size > 0) {
+	            
+	            // Сбрасываем флаг перед отправкой, чтобы открыть доступ для подготовки следующего кадра
+	            net_has_fresh_frame = false;
+	            
+	            // Взводим предзаказ на следующий кадр, который камера подготовит, пока этот отправляется
+	            net_request_new_frame = true; 
+
+	            // Вызываем вашу проверенную функцию отправки. 
+	            // Она может работать сколько угодно долго (в пределах 200 мс), данные в net_mjpeg_buffer защищены!
+	            p2p_uclient_send_mjpeg(net_mjpeg_buffer, net_mjpeg_size);
+	            
+	            ESP_LOGI(TAG, "%ikB Real MJPEG sent (5 FPS stream)", (int)(net_mjpeg_size / 1024));
+	            
+	        } else {
+	            // Если это самый первый запуск или камера пропустила такт
+	            ESP_LOGD(TAG, "No fresh frame in buffer, requesting...");
+	            net_request_new_frame = true; 
+	        }
+	        
+	        vTaskDelay(pdMS_TO_TICKS(10));
+	    } else {
+	        // Если стриминг запрещен, держим запросы закрытыми
+	        net_request_new_frame = false;
+	        net_has_fresh_frame = false;
+	        ESP_LOGI(TAG, "Stream NA");
+	    }
+	}
+
 
     if (fake_mjpeg_frame) free(fake_mjpeg_frame);
 	  
