@@ -6,3 +6,4 @@ sdkconfig.defaults.my
 .gitattributes
 .project
 dependencies.lock
+/.cache

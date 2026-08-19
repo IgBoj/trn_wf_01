@@ -12,6 +12,20 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
+#define LWS_TEST_NODE 0
+
+#if LWS_TEST_NODE
+	#define MASTER_AP_SSID      "ASUS"
+	#define MASTER_AP_PASSWORD  "10011967"
+	#define MASTER_IP_ADDRESS   "192.168.1.66"
+	#define UDP_PORT            5533
+#else
+	#define MASTER_AP_SSID      "ForgeUI-P4-P2P"
+	#define MASTER_AP_PASSWORD  "12345678"
+	#define MASTER_IP_ADDRESS   "192.168.4.1"
+	#define UDP_PORT            3333
+#endif
+
 /* ============================================================
  * Protocol constants (должны совпадать с мастером 30_WIFI.h)
  * ============================================================ */

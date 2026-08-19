@@ -26,6 +26,9 @@
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 #define LCD_BUFFER_COUNT 2
 #define CAMERA_BUFFER_COUNT 3
+#define CAMERA_OUT_WIDTH   400
+#define CAMERA_OUT_HEIGHT  320
+#define CAM_BYTES_PER_PIX  2
 
 #define VCB_DEBUG_MODE 0  // Установите 0 для отключения отладки
 
@@ -45,7 +48,7 @@ size_t form_jpeg_from_rgb(const uint8_t *rgb_buf);
 #include <stdbool.h>
 #include <string.h>
 
-// Резервируем безопасный размер под один JPEG кадр 360x240
+// Резервируем безопасный размер под один JPEG кадр CAMERA_OUT_WIDTH x CAMERA_OUT_HEIGHT
 #define NET_JPEG_MAX_SIZE (25 * 1024) 
 
 // Выделенный изолированный буфер в PSRAM для отправки
@@ -125,41 +128,53 @@ static void camera_video_frame_operation(
         return;
     }
 
-    const uint32_t display_width = 360;
-    const uint32_t display_height = 240;
-    const uint32_t bytes_per_pixel = 2;
-    const uint32_t out_size = display_width * display_height * bytes_per_pixel;
-    const uint32_t buf_index = camera_buf_index % LCD_BUFFER_COUNT;
+	// НАСТРОЙКА ГЕОМЕТРИИ: Финальные размеры на экране
+	const uint32_t display_width = CAMERA_OUT_WIDTH; 
+	const uint32_t display_height = CAMERA_OUT_HEIGHT;
+	const uint32_t bytes_per_pixel = CAM_BYTES_PER_PIX;
+	const uint32_t out_size = display_width * display_height * bytes_per_pixel; 
+	const uint32_t buf_index = camera_buf_index % LCD_BUFFER_COUNT;
 
-    // Прямое масштабирование без crop
-    float scale_x = (float)display_width / (float)camera_buf_hes;
-    float scale_y = (float)display_height / (float)camera_buf_ves;
+	// ИСПРАВЛЕНИЕ: Масштаб по оси X (для ширины 800, которая сожмется в высоту 320)
+	// scale_x = Целевой Размер по этой же оси внутри логики PPA
+	float scale_x = (float)display_height / (float)camera_buf_hes; // 320.0f / 800.0f = 0.40f
 
-    ppa_srm_oper_config_t srm_config = {
-        .in.buffer = camera_buf,
-        .in.pic_w = camera_buf_hes,
-        .in.pic_h = camera_buf_ves,
-        .in.block_w = camera_buf_hes,
-        .in.block_h = camera_buf_ves,
-        .in.block_offset_x = 0,
-        .in.block_offset_y = 0,
-        .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .out.buffer = lcd_buffer[buf_index],
-        .out.buffer_size = ALIGN_UP(out_size, data_cache_line_size),
-        .out.pic_w = display_width,
-        .out.pic_h = display_height,
-        .out.block_offset_x = 0,
-        .out.block_offset_y = 0,
-        .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = scale_x,
-        .scale_y = scale_y,
-        .mirror_x = 1,
-        .mirror_y = 0,
-        .rgb_swap = 0,
-        .byte_swap = 0,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
+	// ИСПРАВЛЕНИЕ: Масштаб по оси Y (для высоты 640, которая растянется в ширину 400)
+	float scale_y = (float)display_width / (float)camera_buf_ves;  // 400.0f / 640.0f = 0.625f
+
+	ppa_srm_oper_config_t srm_config = {
+	    .in.buffer = camera_buf,
+	    .in.pic_w = camera_buf_hes,   // 800
+	    .in.pic_h = camera_buf_ves,   // 640
+	    .in.block_w = camera_buf_hes,
+	    .in.block_h = camera_buf_ves,
+	    .in.block_offset_x = 0,
+	    .in.block_offset_y = 0,
+	    .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+	    
+	    .out.buffer = lcd_buffer[buf_index],
+	    .out.buffer_size = ALIGN_UP(out_size, data_cache_line_size),
+	    .out.pic_w = display_width,   // 400
+	    .out.pic_h = display_height,  // 320
+	    .out.block_offset_x = 0,
+	    .out.block_offset_y = 0,
+	    .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+	    
+	    // Аппаратный поворот на 270 градусов по часовой (= 90 градусов против часовой)
+	    .rotation_angle = PPA_SRM_ROTATION_ANGLE_270, 
+	    .scale_x = scale_x, // 0.40
+	    .scale_y = scale_y, // 0.625
+	    
+	    // Оставляем зеркалирование по вкусу. 
+	    // Для сохранения "фронтального" режима при угле 270 обычно используется mirror_y = 1
+	    .mirror_x = 0,
+	    .mirror_y = 0, 
+	    
+	    .rgb_swap = 0,
+	    .byte_swap = 0,
+	    .mode = PPA_TRANS_MODE_BLOCKING,
+	};
+
 
     esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
     if (ret != ESP_OK) {
@@ -167,51 +182,43 @@ static void camera_video_frame_operation(
         return;
     }
 
-	// КРИТИЧНО: Синхронизация кэша после записи PPA (DMA → CPU)
-	esp_cache_msync(lcd_buffer[buf_index], 
-	                ALIGN_UP(out_size, data_cache_line_size),
-	                ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    // Синхронизация кэша после записи PPA (DMA → CPU)
+    esp_cache_msync(lcd_buffer[buf_index], 
+                    ALIGN_UP(out_size, data_cache_line_size),
+                    ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
 
-	// --- Асинхронное кодирование в JPEG для сети (5 FPS) ---
-	if (is_video_streaming && p2p_uclient_is_stream_allowed() && net_request_new_frame) {
-	    
-	    // Кодируем RGB-массив в рабочий буфер кодировщика
-	    size_t jpeg_len = form_jpeg_from_rgb((const uint8_t *)lcd_buffer[buf_index]);
-	    
-	    if (jpeg_len > 0 && jpeg_len <= NET_JPEG_MAX_SIZE) {
-	        // Мгновенно копируем результат в изолированный сетевой буфер
-	        memcpy(net_mjpeg_buffer, jpeg_out_buffer, jpeg_len);
-	        net_mjpeg_size = jpeg_len;
-	        
-	        // Меняем статус флагов: кадр готов, запрос снимаем
-	        net_has_fresh_frame = true;
-	        net_request_new_frame = false; 
-	        
-	        static int info_cntr_jpg = 0;
-	        if (info_cntr_jpg < 5) {
-	            ESP_LOGI(TAG, "Captured real frame for net: %u bytes", (unsigned int)net_mjpeg_size);
-	            info_cntr_jpg++;
-	        }
-	    }
-	}
-	// -----------------------------------------------------------------
-	                
-	// Настраиваем дескриптор для LVGL 9
-	camera_image_dsc.header.magic = LV_IMAGE_SRC_VARIABLE;
-    camera_image_dsc.header.w = display_width;
-    camera_image_dsc.header.h = display_height;
+    // --- Асинхронное кодирование в JPEG для сети ---
+    if (is_video_streaming && p2p_uclient_is_stream_allowed() && net_request_new_frame) {
+        size_t jpeg_len = form_jpeg_from_rgb((const uint8_t *)lcd_buffer[buf_index]);
+        
+        if (jpeg_len > 0 && jpeg_len <= NET_JPEG_MAX_SIZE) {
+            memcpy(net_mjpeg_buffer, jpeg_out_buffer, jpeg_len);
+            net_mjpeg_size = jpeg_len;
+            net_has_fresh_frame = true;
+            net_request_new_frame = false; 
+        }
+    }
+    // -----------------------------------------------------------------
+                    
+    // Обновляем дескриптор для LVGL 9 под новые размеры 400x320
+    camera_image_dsc.header.magic = LV_IMAGE_SRC_VARIABLE;
+    camera_image_dsc.header.w = display_width;                        // 400
+    camera_image_dsc.header.h = display_height;                       // 320
     camera_image_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    camera_image_dsc.header.stride = display_width * bytes_per_pixel;
+    camera_image_dsc.header.stride = display_width * bytes_per_pixel; // 400 * 2 = 800 байт
     camera_image_dsc.data_size = out_size;
     camera_image_dsc.data = (const uint8_t *)lcd_buffer[buf_index];
 
     // Безопасное обновление LVGL через мьютекс
-	if(bsp_display_lock(-1)){
-        lv_image_set_src(ui_imgCameraView, &camera_image_dsc);
-        lv_obj_invalidate(ui_imgCameraView);
-		bsp_display_unlock();		
-    }
+//    if(bsp_display_lock(-1)){
+//        // Насильно перерисовываем и подгоняем размеры самого виджета, если они были жестко заданы
+//        lv_obj_set_size(ui_imgCameraView, display_width, display_height);
+//        lv_image_set_src(ui_imgCameraView, &camera_image_dsc);
+//        lv_obj_invalidate(ui_imgCameraView);
+//        bsp_display_unlock();		
+//    }
 }
+
 
 /****************************************************************
 ** JPEG extension
@@ -224,8 +231,8 @@ static void init_jpeg_encoder(void) {
     ESP_LOGI(TAG, "Initializing hardware JPEG encoder...");
     
     jpeg_enc_config_t cfg = {
-        .width = 360,              // Ширина виджета камеры
-        .height = 240,             // Высота виджета камеры
+        .width = CAMERA_OUT_WIDTH,              // Ширина виджета камеры
+        .height = CAMERA_OUT_HEIGHT,             // Высота виджета камеры
         .src_type = JPEG_PIXEL_FORMAT_RGB565_LE, // Little Endian RGB565
         .subsampling = JPEG_SUBSAMPLE_420,       // Стандартное сжатие цвета
         .quality = 80,             // Качество 1-100
@@ -242,7 +249,7 @@ static void init_jpeg_encoder(void) {
     // Вычисляем максимальный размер выходного буфера
     // В этой версии библиотеки нет отдельной функции get_max_size, 
     // поэтому берем с запасом (обычно JPEG меньше RAW, но для надежности берем размер RAW)
-    size_t max_size = 360 * 240 * 2; 
+    size_t max_size = CAMERA_OUT_WIDTH * CAMERA_OUT_HEIGHT * CAM_BYTES_PER_PIX; 
     
     // Выделяем буфер в PSRAM
     jpeg_out_buffer = (uint8_t *)heap_caps_malloc(max_size, MALLOC_CAP_SPIRAM);
@@ -266,8 +273,8 @@ size_t form_jpeg_from_rgb(const uint8_t *rgb_buf) {
     }
 
     int encoded_size = 0;
-    size_t input_size = 360 * 240 * 2; // Размер входного буфера в байтах
-    size_t output_max_size = 360 * 240 * 2; // Максимальный размер выходного буфера
+    size_t input_size = CAMERA_OUT_WIDTH * CAMERA_OUT_HEIGHT * CAM_BYTES_PER_PIX; // Размер входного буфера в байтах
+    size_t output_max_size = CAMERA_OUT_WIDTH * CAMERA_OUT_HEIGHT * CAM_BYTES_PER_PIX; // Максимальный размер выходного буфера
 
     // Вызов с правильной сигнатурой (6 аргументов)
     jpeg_error_t ret = jpeg_enc_process(
@@ -298,21 +305,15 @@ void app_main(void) {
 	
 	// 2. Map command listeners
 	p2p_uclient_register_cmd_callback(on_master_command);
-	
+
+	// Dummy tracking buffers
+	uint8_t fake_telemetry[20] = {'H', 'i', '!', ' '};
+#if LWS_TEST_NODE
 	/* ---------- TEST ONLY ---------- */
 	   p2p_uclient_test_force_connected(true);
 	/* ------------------------------- */
-	// Dummy tracking buffers
-	uint8_t fake_telemetry[20] = {'H', 'i', '!', ' '};
-	
-	// Allocate dummy 25 kB camera frame space
-	uint8_t mpg_sz = 25;
-	uint32_t simulated_image_size = mpg_sz * 1024;
-	uint8_t *fake_mjpeg_frame = malloc(simulated_image_size);
-	if (fake_mjpeg_frame) {
-	    memset(fake_mjpeg_frame, 0x55, simulated_image_size);
-	}
-	
+
+#endif	
 	vTaskDelay(pdMS_TO_TICKS(2000));
 	
 	// -------- START DISPLAY --------------
@@ -386,7 +387,7 @@ void app_main(void) {
 	vTaskDelay(pdMS_TO_TICKS(500));
 
 	// 7. Выделяем буферы для LCD
-	size_t lcd_buf_size = ALIGN_UP(360 * 240 * 2, data_cache_line_size);
+	size_t lcd_buf_size = ALIGN_UP(CAMERA_OUT_WIDTH * CAMERA_OUT_HEIGHT   * CAM_BYTES_PER_PIX  , data_cache_line_size);
 	for (int i = 0; i < LCD_BUFFER_COUNT; i++) {
 	    lcd_buffer[i] = heap_caps_aligned_calloc(data_cache_line_size, 1, lcd_buf_size, MALLOC_CAP_SPIRAM);
 	    if (lcd_buffer[i] == NULL) {
@@ -453,7 +454,7 @@ void app_main(void) {
 	            // Она может работать сколько угодно долго (в пределах 200 мс), данные в net_mjpeg_buffer защищены!
 	            p2p_uclient_send_mjpeg(net_mjpeg_buffer, net_mjpeg_size);
 	            
-	            ESP_LOGI(TAG, "%ikB Real MJPEG sent (5 FPS stream)", (int)(net_mjpeg_size / 1024));
+	            ESP_LOGI(TAG, "%ikB JPEG 5 FPS", (int)(net_mjpeg_size / 1024));
 	            
 	        } else {
 	            // Если это самый первый запуск или камера пропустила такт
@@ -470,7 +471,7 @@ void app_main(void) {
 	    }
 	}
 
-
+#if LWS_TEST_NODE
     if (fake_mjpeg_frame) free(fake_mjpeg_frame);
-	  
+#endif	  
 }
